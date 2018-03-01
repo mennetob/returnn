@@ -4606,17 +4606,7 @@ def safe_log(x, eps=1e-20, use_fake_grad=True):
   :rtype: tf.Tensor
   """
   with tf.name_scope("safe_log"):
-    y = check_base_op_type_and_replace(x, "Softmax", "LogSoftmax")
-    if y is not None:
-      return y
-    y = check_base_op_type_and_replace(x, "Sigmoid", "LogSigmoid")
-    if y is not None:
-      return y
-    if use_fake_grad:
-      x = maximum_with_identity_grad(x, eps)
-    else:
-      x = tf.maximum(x, eps)
-    return tf.log(x)
+    return tf.log(tf.maximum(x, eps))
 
 
 def safe_exp(x, eps=1e-20):
