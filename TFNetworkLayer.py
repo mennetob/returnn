@@ -1227,6 +1227,8 @@ class ReuseParams:
     assert not base_scope_name or base_scope_name.endswith("/")
     assert name.startswith(base_scope_name)
     rel_name = name[len(base_scope_name):]  # e.g. "rec/W" or "W"
+    if "rec/" in rel_name:
+      rel_name = name[len(base_scope_name + "rec/"):]
     if self.custom_func:
       return self.custom_func(
         base_layer=base_layer, reuse_layer=self.reuse_layer, name=rel_name, getter=getter, full_name=name, **kwargs)
@@ -6012,67 +6014,57 @@ class DeepClusteringLoss(Loss):
 
   def get_value(self):
     assert not self.target.sparse, "sparse is not supported yet"
-    assert self.target.dim == self.output.dim
     with tf.name_scope("loss_deep_clustering"):
-      # iterate through all chunks and compute affinity cost function for every chunk separately
+      output = tf.transpose(self.output.placeholder, perm=[1, 0, 2])
+      target = self.target.placeholder
+      v = tf.reshape(output, (tf.shape(output)[0], tf.shape(output)[1] * (tf.shape(output)[2] / self._embedding_dimension), self._embedding_dimension))
+      y = tf.reshape(target, (tf.shape(target)[0], tf.shape(target)[1] * (tf.shape(target)[2] / self._nr_of_sources), self._nr_of_sources))
+      c = tf.square(tf.norm(tf.matmul(tf.transpose(v, perm=[0, 2, 1]), v), axis=[-2, -1])) - 2 * tf.square(tf.norm(tf.matmul(tf.transpose(v, perm=[0, 2, 1]), y), axis=[-2, -1])) + tf.square(tf.norm(tf.matmul(tf.transpose(y, perm=[0, 2, 1]), y), axis=[-2, -1]))
+      return self.reduce_func(c)
 
-      def iterate_sequences(s, start, c):
-        return tf.less(s, tf.shape(self.output_seq_lens)[0])
 
-      def compute_cost(s, start, c):
-        """
-        :param tf.Tensor s: scalar, int32, seq idx
-        :param tf.Tensor start: scalar, int32, time offset
-        :param tf.Tensor c: scalar, float32, accumulated loss
-        :return: new (s, start, c)
-        :rtype: (tf.Tensor, tf.Tensor, tf.Tensor)
-        """
-        seq_length = self.output_seq_lens[s]  # scalar, int32
-        # Note: This slice indexed access will be inefficient to do in every frame of the loop.
-        #   It's better to use a tf.TensorArray.
-        #   It would also be better/faster/easier to use self.output/self.target instead of the flat variants.
-        #   It would also maybe be easier to use tf.foldl, tf.scan or some of the other variants instead
-        #   of tf.while_loop.
-        chunk_out = self.output_flat[start:(start + seq_length), :]  # (time, dim)
-        chunk_target = self.target_flat[start:(start + seq_length), :]  # (time, dim)
-        # convert network output into embedding vectors
-        # Note: The first reshape is redundant if you reshape it right after again.
-        v = tf.reshape(
-          tf.reshape(
-            chunk_out,
-            (tf.shape(chunk_out)[0], tf.shape(chunk_out)[1] // self._embedding_dimension, self._embedding_dimension)),
-          (tf.shape(chunk_out)[0] * (tf.shape(chunk_out)[1] // self._embedding_dimension), self._embedding_dimension))
-        # convert targets into class vectors
-        # Note: The first reshape is redundant if you reshape it right after again.
-        y = tf.reshape(
-          tf.reshape(
-            chunk_target,
-            (tf.shape(chunk_target)[0], tf.shape(chunk_target)[1] // self._nr_of_sources, self._nr_of_sources)),
-          (tf.shape(chunk_target)[0] * (tf.shape(chunk_target)[1] // self._nr_of_sources), self._nr_of_sources))
-        chunk_c = (
-          tf.pow(tf.norm(tf.matmul(tf.transpose(v), v)), 2)
-          - 2.0 * tf.pow(tf.norm(tf.matmul(tf.transpose(v), y)), 2)
-          + tf.pow(tf.norm(tf.matmul(tf.transpose(y), y)), 2))
-        # append chunk cost to cost tensor
-        # Note: It's very inefficient to have a different shape in each frame of the loop.
-        #   A tf.TensorArray should be used instead.
-        #   As I see from the code, you are anyway reducing it at the end,
-        #   so it would be even easier to just accumulate it here (just sum it).
-        # Note: tf.cond can be slow. It should only be used if the arguments are very expensive to compute.
-        #   Maybe tf.where might be better. But if you just sum it up, you don't have that problem here anyway.
-        c = tf.cond(
-          tf.greater(s, 0),
-          lambda: tf.concat([c, tf.reshape(chunk_c, (1,))], axis=0),
-          lambda: tf.reshape(chunk_c, (1,)))
-        return tf.add(s, 1), tf.add(start, seq_length), c
+class PermutationMSE(Loss):
+  class_name = "permute_mse"
 
-      c = tf.constant(0.0)
-      s = tf.constant(0, dtype=tf.int32)
-      start = tf.constant(0, dtype=tf.int32)
-      r = tf.while_loop(
-        iterate_sequences, compute_cost, [s, start, c],
-        shape_invariants=[s.get_shape(), start.get_shape(), tf.TensorShape([None])])
-      return self.reduce_func(r[-1])
+  def __init__(self, feature_dim=257, **kwargs):
+    super(PermutationMSE, self).__init__(**kwargs)
+    self.feature_dim = feature_dim
+
+  def _check_init(self):
+    """
+    Does some checks on self.target and self.output, e.g. if the dense shapes matches.
+    You can overwrite this if those checks don't make sense for your derived loss class.
+    """
+    assert self.target.ndim_dense == self.output.ndim_dense, (
+      "Number of dimensions mismatch. Target: %s, output: %s" % (self.target, self.output))
+    expected_output_dim = self.feature_dim * 2
+    assert expected_output_dim == self.output.dim, (
+      "Expected output dim is %i but the output has dim %i. " % (expected_output_dim, self.output.dim) +
+      "Target: %s, output: %s" % (self.target, self.output))
+
+  def get_error(self):
+    """
+    :return: frame error rate as a scalar value
+    :rtype: tf.Tensor | None
+    """
+    return None
+
+  def get_value(self):
+    with tf.name_scope("loss_perm_mse"):
+      assert self.target.dim == self.output.dim
+      # number of sources is hard-coded for now
+      nr_of_sources = 2
+      from TFUtil import safe_log
+      source_targets = tf.split(tf.transpose(safe_log(self.target.placeholder), perm=[1, 0, 2]), num_or_size_splits=nr_of_sources, axis=2)
+      source_outputs = tf.split(safe_log(self.output.placeholder), num_or_size_splits=nr_of_sources, axis=2)
+      pairwise_error_1 = tf.squared_difference(source_outputs[0], source_targets[0])
+      pairwise_error_2 = tf.squared_difference(source_outputs[0], source_targets[1])
+      pairwise_error_3 = tf.squared_difference(source_outputs[1], source_targets[0])
+      pairwise_error_4 = tf.squared_difference(source_outputs[1], source_targets[1])
+      assignment_error_1 = self.reduce_func(tf.add(pairwise_error_1, pairwise_error_4))
+      assignment_error_2 = self.reduce_func(tf.add(pairwise_error_2, pairwise_error_3))
+      output = tf.minimum(assignment_error_1, assignment_error_2)
+      return output
 
 
 class L1Loss(Loss):

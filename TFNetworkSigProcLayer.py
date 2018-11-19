@@ -627,3 +627,72 @@ class TileFeaturesLayer(_ConcatInputLayer):
       size_placeholder={0: input_data.size_placeholder[input_data.time_dim_axis_excluding_batch]},
       batch_dim_axis=0,
       time_dim_axis=1)
+
+
+class EmbeddingBasedSoftKmeansLayer(LayerBase):
+  """
+  This layer implements soft Kmeans algorithm from the paper https://arxiv.org/abs/1607.02173
+  """
+
+  layer_class = "soft_clustering"
+
+  def __init__(self, nr_of_sources=2, num_of_frequency_bins=257, **kwargs):
+    """
+    :param int nr_of_sources: number of sources in the mixture
+    :param int num_of_frequency_bins: feature dimension.
+    """
+    super(EmbeddingBasedSoftKmeansLayer, self).__init__(**kwargs)
+
+    from tfSi6Proc.audioProcessing.estimators.maskEstimators import EmbeddingBasedSoftKmeansMaskEstimation
+
+    embeddings = self.sources[0].output.get_placeholder_as_batch_major()
+    mixture = self.sources[1].output.get_placeholder_as_batch_major()
+
+    embeddings = tf.divide(embeddings,tf.tile(tf.reshape(tf.norm(embeddings, axis=2), shape=(tf.shape(embeddings)[0],tf.shape(embeddings)[1], 1)),[1, 1, tf.shape(embeddings)[2]]))
+    embeddings = tf.reshape(embeddings, shape=(tf.shape(embeddings)[0], tf.shape(embeddings)[1], num_of_frequency_bins, tf.shape(embeddings)[2] / num_of_frequency_bins))
+    self.embeddings = embeddings
+    amplitude_mixture = tf.square(mixture)
+    # estimate source masks with soft Kmeans
+    embeddingBasedSoftKmeansMaskEstimation = EmbeddingBasedSoftKmeansMaskEstimation(mixture, embeddings, nrOfSources=nr_of_sources, flag_inputHasBatch=1)
+    self.masks = embeddingBasedSoftKmeansMaskEstimation.getMasks()
+    self.means = embeddingBasedSoftKmeansMaskEstimation.getMeans()
+    output = []
+    for i in range(nr_of_sources):
+      output.append(amplitude_mixture)
+      amplitude_source = tf.square(tf.multiply(mixture, self.masks[:,i,:,:]))
+      output.append(amplitude_source)
+    output = tf.concat(output, axis=2)
+
+    output = tf.concat([output, amplitude_mixture], axis=2)
+    self.output.placeholder = output
+    self.output.size_placeholder = self.sources[1].output.size_placeholder.copy()
+
+  @classmethod
+  def get_out_data_from_opts(cls, out_type={}, n_out=None, **kwargs):
+    out_type.setdefault("dim", n_out)
+    out_type["batch_dim_axis"] = 0
+    out_type["time_dim_axis"] = 1
+    return super(EmbeddingBasedSoftKmeansLayer, cls).get_out_data_from_opts(out_type=out_type, **kwargs)
+
+
+class SignalReconstruction(_ConcatInputLayer):
+  layer_class = "signal_reconstruct"
+
+  def __init__(self, nr_of_sources=2, feature_dim=257, **kwargs):
+    super(SignalReconstruction, self).__init__(**kwargs)
+    data = self.input_data
+    self.masks = tf.transpose(tf.reshape(data.placeholder[:, :, :feature_dim * 2], [tf.shape(data.placeholder)[0], tf.shape(data.placeholder)[1], 2, feature_dim]), perm=[0, 1, 3, 2])
+    safe_masks = self.masks - tf.reduce_max(self.masks, reduction_indices=-1, keep_dims=True)
+    exp_masks = tf.exp(safe_masks)
+    self.softmax = softmax = exp_masks / tf.reduce_sum(exp_masks, -1, keep_dims=True)
+    self.mixture = mixture =  tf.expand_dims(data.placeholder[:, :, feature_dim * 2:], -1)
+    mult = tf.multiply(softmax, mixture)
+    signal1, signal2 = tf.split(mult, 2, axis=3)
+    self.output.placeholder = tf.squeeze(tf.concat([signal1, signal2], axis=2), axis=3)
+
+    @classmethod
+    def get_out_data_from_opts(cls, out_type={}, n_out=None, **kwargs):
+      out_type.setdefault("dim", n_out)
+      out_type["batch_dim_axis"] = 1
+      out_type["time_dim_axis"] = 0
+      return super(SignalReconstruction, cls).get_out_data_from_opts(out_type=out_type, **kwargs)
