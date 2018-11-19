@@ -631,11 +631,7 @@ class TileFeaturesLayer(_ConcatInputLayer):
 
 class EmbeddingBasedSoftKmeansLayer(LayerBase):
   """
-  This layer applies GEV beamforming to a multichannel signal. The different
-  channels are assumed to be concatenated to the
-  input feature vector. The first source to the layer must contain the complex
-  spectrograms of the single channels and the
-  second source must contain the noise and speech masks
+  This layer implements soft Kmeans algorithm from the paper https://arxiv.org/abs/1607.02173
   """
 
   layer_class = "soft_clustering"
@@ -644,8 +640,6 @@ class EmbeddingBasedSoftKmeansLayer(LayerBase):
     """
     :param int nr_of_sources: number of sources in the mixture
     :param int num_of_frequency_bins: feature dimension.
-                              For more information see
-                              tfSi6Proc.audioProcessing.enhancement.beamforming.TfMaskBasedGevBeamformer
     """
     super(EmbeddingBasedSoftKmeansLayer, self).__init__(**kwargs)
 
@@ -687,8 +681,8 @@ class SignalReconstruction(_ConcatInputLayer):
   def __init__(self, nr_of_sources=2, feature_dim=257, **kwargs):
     super(SignalReconstruction, self).__init__(**kwargs)
     data = self.input_data
-    self.masks = masks = tf.transpose(tf.reshape(data.placeholder[:, :, :feature_dim * 2], [tf.shape(data.placeholder)[0], tf.shape(data.placeholder)[1], 2, feature_dim]), perm=[0, 1, 3, 2])
-    safe_masks = masks - tf.reduce_max(masks, reduction_indices=-1, keep_dims=True)
+    self.masks = tf.transpose(tf.reshape(data.placeholder[:, :, :feature_dim * 2], [tf.shape(data.placeholder)[0], tf.shape(data.placeholder)[1], 2, feature_dim]), perm=[0, 1, 3, 2])
+    safe_masks = self.masks - tf.reduce_max(self.masks, reduction_indices=-1, keep_dims=True)
     exp_masks = tf.exp(safe_masks)
     self.softmax = softmax = exp_masks / tf.reduce_sum(exp_masks, -1, keep_dims=True)
     self.mixture = mixture =  tf.expand_dims(data.placeholder[:, :, feature_dim * 2:], -1)
